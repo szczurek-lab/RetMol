@@ -15,11 +15,9 @@ from torch.optim import AdamW
 import deepspeed
 from deepspeed.utils import RepeatingLoader
 
-from utils.tokenizer import load_tokenizer
 from megatron_molbart.decoder import DecodeSampler
-from csv_data_retrieval import MoleculeDataLoader
-from megatron_molbart.megatron_bart import MegatronBARTRetrieval
-from megatron_molbart.util import DEFAULT_CHEM_TOKEN_START, DEFAULT_VOCAB_PATH, REGEX
+from csv_data_retrieval_jointformer import MoleculeDataLoader
+from megatron_molbart.megatron_bart import MegatronJointformerRetrieval
 from megatron_molbart.checkpointing import save_megatron_checkpoint, load_deepspeed_iteration, get_checkpoint_name
 
 project_home = os.environ['PROJECT_HOME']
@@ -30,8 +28,18 @@ from megatron.model.transformer import LayerNorm
 from megatron.learning_rates import AnnealingLR
 from megatron.utils import reduce_losses
 from megatron.training import evaluate
+sys.path.insert(1, os.path.join(project_home, 'MolBART/megatron_molbart/jointformer/'))
+from jointformer.configs.tokenizer import TokenizerConfig
+from jointformer.configs.model import ModelConfig
+from jointformer.utils.tokenizers.auto import AutoTokenizer
+from jointformer.models.auto import AutoModel
 
-tokenizer = load_tokenizer(vocab_path=DEFAULT_VOCAB_PATH, chem_token_start=DEFAULT_CHEM_TOKEN_START, regex=REGEX)
+#supply here a path to the tokenizer you want to use
+
+PATH_TO_TOKENIZER_CONFIG='_path_to_tokenizer_'
+tokenizer_config = TokenizerConfig.from_config_file(PATH_TO_TOKENIZER_CONFIG)
+tokenizer = AutoTokenizer.from_config(tokenizer_config)
+
 num_batches_processed = 0
 epochs = 0
 
@@ -94,48 +102,41 @@ class RepeatingLoader:
 
 
 def build_model(args):
-    VOCAB_SIZE = len(tokenizer)
-    MAX_SEQ_LEN = 512
-    pad_token_idx = tokenizer.vocab[tokenizer.pad_token]
+    #change these according to the configurations your tokenizer uses
+    VOCAB_SIZE = 595
+    MAX_SEQ_LEN = 128
+    
+    
+    pad_token_idx = tokenizer.pad_token_id
     sampler = DecodeSampler(tokenizer, MAX_SEQ_LEN)
-
-    model = MegatronBARTRetrieval(
+    # supply a path to the model cofiguration here
+    PATH_TO_MODEL_CONFIG='_path_to_your_model_configuration'
+    model_config = ModelConfig.from_config_file(PATH_TO_MODEL_CONFIG)
+    jointformer_model = AutoModel.from_config(model_config)
+    # put here a path to the checkpoint for the jointofrmer model you intend to use
+    checkpoint_name = '_path_to_your_jointformer_checkpoint'
+    jointformer_model.load_pretrained(checkpoint_name)
+    jointformer_model.cuda()
+    model = MegatronJointformerRetrieval(
         sampler,
         pad_token_idx,
         VOCAB_SIZE,
         args.hidden_size,
         args.num_layers,
         args.num_attention_heads,
-        args.hidden_size * 4,
-        MAX_SEQ_LEN,
-        dropout=0.1,
+        args.hidden_size,
+        args.max_position_embeddings,
+        jointformer_model,
+        dropout=0.0,
+        num_beams=1,
     )
 
     if args.train_from == 'stage1':
         model.add_fuser()
 
-    # load the encoder and decoder
-    checkpoint_name = get_checkpoint_name(os.path.join(project_home, args.pretrain_model_path), args.model_ckpt_itr)
-
-    if mpu.get_data_parallel_rank() == 0:
-        print('global rank {} is loading checkpoint {}'.format(
-            torch.distributed.get_rank(), checkpoint_name))
-    try:
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
-    except ModuleNotFoundError:
-        # For backward compatibility.
-        print_rank_0(' > deserializing using the old code structure ...')
-        sys.modules['fp16.loss_scaler'] = sys.modules[
-            'megatron.fp16.loss_scaler']
-        state_dict = torch.load(checkpoint_name, map_location='cpu')
-        sys.modules.pop('fp16.loss_scaler', None)
-    except BaseException:
-        print_rank_0('could not load the checkpoint')
-        sys.exit()
-    model.load_state_dict(state_dict['model'])
-
     if args.train_from == 'pretrain':
         model.add_fuser()  # attr fine tuning
+    model = model.cuda()
 
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters()
@@ -208,8 +209,6 @@ def get_batch(data_iterator):
     keys = [
         'encoder_input',
         'encoder_pad_mask',
-        'decoder_input',
-        'decoder_pad_mask',
         'target',
         'target_pad_mask',
         'retrieved_smiles',
@@ -217,13 +216,14 @@ def get_batch(data_iterator):
     ]
     datatype = torch.int64
     data = next(data_iterator)
+    data['encoder_pad_mask'] = data['encoder_pad_mask'].to(datatype)
+    data['target_pad_mask']  = data['target_pad_mask'].to(datatype)
+    data['retrieved_pad_mask'] = data['retrieved_pad_mask'].to(datatype)
     data_b = mpu.broadcast_data(keys, data, datatype)
 
     # Unpack.
     encoder_tokens = data_b['encoder_input'].long()
     encoder_pad_mask = data_b['encoder_pad_mask'].bool()
-    decoder_tokens = data_b['decoder_input'].long()
-    decoder_pad_mask = data_b['decoder_pad_mask'].bool()
     target = data_b['target'].long()
     target_pad_mask = data_b['target_pad_mask'].long()
     retrieved_tokens = data_b['retrieved_smiles'].long()
@@ -233,8 +233,6 @@ def get_batch(data_iterator):
     return {
         'encoder_input': encoder_tokens,
         'encoder_pad_mask': encoder_pad_mask,
-        'decoder_input': decoder_tokens,
-        'decoder_pad_mask': decoder_pad_mask,
         'target': target,
         'target_pad_mask': target_pad_mask,
         'retrieved_smiles': retrieved_tokens,
@@ -297,6 +295,7 @@ def train_step(
         lr_scheduler,
         pipe_parallel_size,
 ):
+    torch.cuda.empty_cache()
     """Single training step."""
 
     timers = get_timers()

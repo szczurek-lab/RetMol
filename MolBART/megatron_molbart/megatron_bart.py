@@ -21,6 +21,7 @@ import torch.nn.functional as F
 import torch
 import math
 from functools import partial
+from torch.cuda.amp import autocast
 from apex.normalization import FusedLayerNorm
 from util import DEFAULT_CHEM_TOKEN_START, DEFAULT_VOCAB_PATH, REGEX
 
@@ -1390,3 +1391,226 @@ class MegatronBARTRetrieval(MegatronBART):
                           for b in range(memory_for_aggregation.shape[1])]
         
         return (mol_strs, aggregated_embeddings, memory_raw)
+
+class MegatronJointformerRetrieval(MegatronBART):
+    def __init__(
+            self,
+            decode_sampler,
+            pad_token_idx,
+            vocab_size,
+            d_model,
+            num_layers,
+            num_heads,
+            d_feedforward,
+            max_seq_len,
+            jointformer,
+            dropout=0.0,
+            val_sampling_alg='greedy',
+            num_beams=10,
+    ):
+        super().__init__(decode_sampler,
+                         pad_token_idx,
+                         vocab_size,
+                         d_model,
+                         num_layers,
+                         num_heads,
+                         d_feedforward,
+                         max_seq_len,
+                         dropout,
+                         val_sampling_alg=val_sampling_alg,
+                         num_beams=num_beams,
+                         )
+        self.jointformer = jointformer
+        self.encoder=None
+        self.decoder=None
+        self.tokenizer = decode_sampler.tokeniser
+    def add_fuser(self):
+        self.fuser = MultiheadAttentionRetrieval(self.d_model,
+                                                 self.num_heads,
+                                                 self.dropout,
+                                                 bias=True,
+                                                 init_method=self.init_method,
+                                                 )
+    def add_bottleneck(self):
+        # self.bottleneck = 
+        return None
+    def _construct_input_retrieval(self, token_ids):
+        return NotImplementedError("construct_input_retrieval not implemented for the Jointformer version")
+    def encode(self, x):
+        encoder_input = x['encoder_input'].transpose(0,1)
+        ret_smiles = x['retrieved_smiles']
+        encoder_pad_mask = x['encoder_pad_mask'].transpose(0, 1).bool()
+        ret_pad_mask = x['retrieved_pad_mask']   # b, k*r
+        k,r,b = ret_smiles.shape
+        ret_smiles = ret_smiles.transpose(0,1)
+        ret_smiles = ret_smiles.reshape(r,k*b)
+        #ret_smiles = ret_smiles.transpose(0,1)
+        ret_pad_mask = x['retrieved_pad_mask']
+        ret_pad_mask = ret_pad_mask.reshape(b,k,r)
+        ret_pad_mask = ret_pad_mask.transpose(0,1)
+        ret_pad_mask = ret_pad_mask.reshape(k*b, r)
+        memory = self.jointformer(encoder_input, "generation", encoder_pad_mask)['lm_embeddings']
+        memory = memory.transpose(0,1)
+        ret_pad_mask = ret_pad_mask.transpose(0,1)
+        ret_memory = self.jointformer(ret_smiles, "generation", ret_pad_mask)['lm_embeddings'] 
+        ret_memory = ret_memory.transpose(0,1)
+        d = ret_memory.shape[2]
+        ret_memory = ret_memory.reshape(r,k,b,d)
+        with autocast():
+            fused_memory,_ = self.fuser(memory, ret_memory, ret_pad_mask)
+            fused_memory = fused_memory.transpose(0,1)
+        return fused_memory
+    
+    def decode(self, batch):
+        """ Construct an output from a given decoder input
+        """
+        model_output = self.jointformer.lm_head(batch)
+        return model_output
+    
+    def forward(self, x):
+        encoder_input = x['encoder_input'].transpose(0,1)
+        ret_smiles = x['retrieved_smiles']
+        encoder_pad_mask = x['encoder_pad_mask'].transpose(0, 1)
+        ret_pad_mask = x['retrieved_pad_mask']  
+        k,r,b = ret_smiles.shape
+        ret_smiles = ret_smiles.transpose(0,1)
+        ret_smiles = ret_smiles.reshape(r,k*b)
+        ret_pad_mask = x['retrieved_pad_mask']
+        ret_pad_mask = ret_pad_mask.reshape(b,k,r)
+        ret_pad_mask = ret_pad_mask.transpose(0,1)
+        ret_pad_mask = ret_pad_mask.reshape(k*b, r)
+        memory = self.jointformer(encoder_input, "prediction", encoder_pad_mask)['lm_embeddings']
+        memory = memory.transpose(0,1)
+        ret_pad_mask = ret_pad_mask.transpose(0,1)
+        ret_memory = self.jointformer(ret_smiles, "prediction", ret_pad_mask)['lm_embeddings'] 
+        ret_memory = ret_memory.transpose(0,1)
+        d = ret_memory.shape[2]
+        ret_memory = ret_memory.reshape(r,k,b,d)
+        with autocast():
+            fused_memory, weights = self.fuser(memory, ret_memory, ret_pad_mask)
+            fused_memory = fused_memory.transpose(0,1)
+            model_output = self.jointformer.lm_head(fused_memory)
+
+        output = {'model_output': model_output,
+                  'token_output': model_output}
+        return output
+    
+    def sample_molecules(self, batch_input,sampling_alg='greedy', jitter_std=1, num_beams=10):
+        """ Sample molecules from the model
+        Args:
+            batch_input (dict): Input given to model
+            sampling_alg (str): Algorithm to use to sample SMILES strings from model
+        Returns:
+            ([[str]], [[float]]): Tuple of molecule SMILES strings and log lhs (outer dimension is batch)
+        """
+        def _set_pad_tokens(tokens, eos_token_id, pad_token_id):
+            for example_idx in range(tokens.size(0)):
+                eos = False
+                for token_idx in range(tokens.size(1)):
+                    current_token = pad_token_id if eos else tokens[example_idx, token_idx]  
+                    eos = True if current_token == eos_token_id else eos
+                    tokens[example_idx, token_idx] = current_token
+            return tokens
+
+        def _sample(logits: torch.Tensor, temperature: float, top_k: int, eos_token_id, pad_token_id) -> torch.Tensor:
+            logits = logits[:,-1,:] / temperature
+            v, _ = torch.topk(logits, top_k)
+            threshold, _ = v.min(dim=-1)
+            logits[logits < threshold.unsqueeze(-1)] = -float('Inf')
+            probs = F.softmax(logits, dim=-1)
+            tokens = torch.distributions.Categorical(probs).sample()
+            return _set_pad_tokens(tokens, eos_token_id, pad_token_id)
+        
+        #logits = torch.randn(batch_size, seq_len, vocab_size)
+        temperature = 0.8
+        top_k = 10
+        eos_token_id = self.tokenizer.cls_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+        enc_input = batch_input['encoder_input']
+        enc_mask = batch_input['encoder_pad_mask']
+
+        with torch.no_grad():
+            memory = self.encode(batch_input)
+            if sampling_alg == 'random_batch_jitter':
+                noise = torch.normal(0, 1, memory.shape).cuda()
+                memory = noise + memory
+            #(_, batch_size, _) = tuple(memory.size())   
+            logits = self.decode(memory)
+            tokens = _sample(logits=logits, temperature=temperature, top_k=top_k, eos_token_id=eos_token_id, pad_token_id=pad_token_id)
+            #tokens = tokens.transpose(0,1)
+            return self.tokenizer.decode(tokens)
+
+
+    
+
+    def sample_molecules_v2(self, batch_input, sampling_alg='greedy', jitter_std=1, num_beams=10):
+        """ Sample molecules from the model
+        Args:
+            batch_input (dict): Input given to model
+            sampling_alg (str): Algorithm to use to sample SMILES strings from model
+        Returns:
+            smiles, retrieval-based embedding, attention matrix
+        """
+        enc_input = batch_input['encoder_input']
+        enc_mask = batch_input['encoder_pad_mask']
+
+            
+        def generate(self, tokenizer, batch_size, temperature, top_k, device):
+            """
+            Generate complete sequences of indices using the model.
+            """
+            assert hasattr(tokenizer, 'generation_prefix'), "Tokenizer must have a `generation_prefix` attribute."
+            eos_token_id = tokenizer.sep_token_id
+            pad_token_id = tokenizer.pad_token_id
+
+            # generate prefix
+            prefix = torch.tensor(tokenizer.generation_prefix, device=device).long().unsqueeze(0).expand(batch_size, -1)
+
+            # TODO: implement caching
+            idx = self.generate_single_token(prefix, tokenizer.max_molecule_length - 2, temperature, top_k, eos_token_id, pad_token_id)
+
+            # TODO: vectorize
+            # check for completion
+            for sequence_idx, sequence in enumerate(idx):
+                if eos_token_id not in sequence:
+                    idx[sequence_idx, -1] = eos_token_id
+            return idx
+
+        @torch.no_grad()
+        def generate_single_token(self, idx, max_new_tokens, temperature, top_k, eos_token_id, pad_token_id):
+            """
+            Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+            the sequence max_new_tokens times, feeding the predictions back into the model each time.
+            Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+            """
+
+            eos_flag = torch.zeros(size=(idx.size(0), 1), dtype=torch.bool, device=idx.device)
+
+            for _ in range(max_new_tokens):
+                if eos_token_id:
+                    is_end = torch.logical_or(idx[:, [-1]] == eos_token_id, idx[:, [-1]] == pad_token_id)
+                    eos_flag = torch.logical_or(eos_flag, is_end)
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
+                # forward the model to get the logits for the index in the sequence
+                outputs = self(input_ids=idx_cond, attention_mask=None, next_token_only=True, task='generation')
+                logits = outputs['logits_generation']
+
+                # pluck the logits at the final step and scale by desired temperature
+                logits = logits[:, -1, :] / temperature
+
+                # optionally crop the logits to only the top k options
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('Inf')
+
+                # apply softmax to convert logits to (normalized) probabilities
+                probs = F.softmax(logits, dim=-1)
+
+                # sample from the distribution
+                idx_next = torch.multinomial(probs, num_samples=1)
+                idx_next = torch.where(eos_flag, torch.ones_like(idx_next) * pad_token_id, idx_next)
+                # append sampled index to the running sequence and continue
+                idx = torch.cat((idx, idx_next), dim=1)
+
+            return idx
